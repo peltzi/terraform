@@ -114,6 +114,7 @@ type provisioner struct {
 	UserKey               string
 	Vaults                map[string][]string
 	Version               string
+	VaultVersion          string
 
 	cleanupUserKeyCmd     string
 	createConfigFiles     provisionFn
@@ -249,6 +250,10 @@ func Provisioner() terraform.ResourceProvisioner {
 				Optional: true,
 			},
 			"version": &schema.Schema{
+				Type:     schema.TypeString,
+				Optional: true,
+			},
+			"vault_version": &schema.Schema{
 				Type:     schema.TypeString,
 				Optional: true,
 			},
@@ -568,7 +573,13 @@ func (p *provisioner) generateClientKeyFunc(knifeCmd string, confDir string, noO
 
 func (p *provisioner) configureVaultsFunc(gemCmd string, knifeCmd string, confDir string) provisionFn {
 	return func(o terraform.UIOutput, comm communicator.Communicator) error {
-		if err := p.runCommand(o, comm, fmt.Sprintf("%s install chef-vault", gemCmd)); err != nil {
+		var vaultVersion string
+		if p.VaultVersion != "" {
+			vaultVersion = fmt.Sprintf(" -v %s ", p.VaultVersion)
+		} else {
+			vaultVersion = ""
+		}
+		if err := p.runCommand(o, comm, fmt.Sprintf("%s install chef-vault%s", gemCmd, vaultVersion)); err != nil {
 			return err
 		}
 
@@ -745,6 +756,7 @@ func decodeConfig(d *schema.ResourceData) (*provisioner, error) {
 		UserName:              d.Get("user_name").(string),
 		UserKey:               d.Get("user_key").(string),
 		Version:               d.Get("version").(string),
+		VaultVersion:          d.Get("vault_version").(string),
 	}
 
 	// Make sure the supplied URL has a trailing slash
