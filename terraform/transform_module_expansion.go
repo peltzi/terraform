@@ -17,9 +17,16 @@ import (
 // that can be contained within modules have already been added.
 type ModuleExpansionTransformer struct {
 	Config *configs.Config
+
+	// Concrete allows injection of a wrapped module node by the graph builder
+	// to alter the evaluation behavior.
+	Concrete ConcreteModuleNodeFunc
+
+	closers map[string]*nodeCloseModule
 }
 
 func (t *ModuleExpansionTransformer) Transform(g *Graph) error {
+	t.closers = make(map[string]*nodeCloseModule)
 	// The root module is always a singleton and so does not need expansion
 	// processing, but any descendent modules do. We'll process them
 	// recursively using t.transform.
@@ -29,6 +36,26 @@ func (t *ModuleExpansionTransformer) Transform(g *Graph) error {
 			return err
 		}
 	}
+
+	// Now go through and connect all nodes to their respective module closers.
+	// This is done all at once here, because orphaned modules were already
+	// handled by the RemovedModuleTransformer, and those module closers are in
+	// the graph already, and need to be connected to their parent closers.
+	for _, v := range g.Vertices() {
+		// any node that executes within the scope of a module should be a
+		// GraphNodeModulePath
+		pather, ok := v.(GraphNodeModulePath)
+		if !ok {
+			continue
+		}
+		if closer, ok := t.closers[pather.ModulePath().String()]; ok {
+			// The module root depends on each child resource instance, since
+			// during apply the module expansion will complete before the
+			// individual instances are applied.
+			g.Connect(dag.BasicEdge(closer, v))
+		}
+	}
+
 	return nil
 }
 
@@ -36,11 +63,16 @@ func (t *ModuleExpansionTransformer) transform(g *Graph, c *configs.Config, pare
 	_, call := c.Path.Call()
 	modCall := c.Parent.Module.ModuleCalls[call.Name]
 
-	v := &nodeExpandModule{
+	n := &nodeExpandModule{
 		Addr:       c.Path,
 		Config:     c.Module,
 		ModuleCall: modCall,
 	}
+	var v dag.Vertex = n
+	if t.Concrete != nil {
+		v = t.Concrete(n)
+	}
+
 	g.Add(v)
 	log.Printf("[TRACE] ModuleExpansionTransformer: Added %s as %T", c.Path, v)
 
@@ -49,16 +81,15 @@ func (t *ModuleExpansionTransformer) transform(g *Graph, c *configs.Config, pare
 		g.Connect(dag.BasicEdge(v, parentNode))
 	}
 
-	// Add the root module node to provide a single exit point for the expanded
-	// module.
-	moduleRoot := &nodeCloseModule{
+	// Add the closer (which acts as the root module node) to provide a
+	// single exit point for the expanded module.
+	closer := &nodeCloseModule{
 		Addr: c.Path,
 	}
-	g.Add(moduleRoot)
-	g.Connect(dag.BasicEdge(moduleRoot, v))
+	g.Add(closer)
+	g.Connect(dag.BasicEdge(closer, v))
+	t.closers[c.Path.String()] = closer
 
-	// Connect any node that reports this module as its Path to ensure that
-	// the module expansion will be handled before that node.
 	for _, childV := range g.Vertices() {
 		pather, ok := childV.(GraphNodeModulePath)
 		if !ok {
@@ -67,11 +98,6 @@ func (t *ModuleExpansionTransformer) transform(g *Graph, c *configs.Config, pare
 		if pather.ModulePath().Equal(c.Path) {
 			log.Printf("[TRACE] ModuleExpansionTransformer: %s must wait for expansion of %s", dag.VertexName(childV), c.Path)
 			g.Connect(dag.BasicEdge(childV, v))
-
-			// The module root also depends on each child instance, since
-			// during apply the module expansion will complete before the
-			// individual instances are applied.
-			g.Connect(dag.BasicEdge(moduleRoot, childV))
 		}
 	}
 

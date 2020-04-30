@@ -3,6 +3,7 @@ package providercache
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/hashicorp/terraform/addrs"
 	"github.com/hashicorp/terraform/internal/copydir"
 	"github.com/hashicorp/terraform/internal/getproviders"
+	tfversion "github.com/hashicorp/terraform/version"
 )
 
 // Installer is the main type in this package, representing a provider installer
@@ -34,7 +36,22 @@ type Installer struct {
 	// both the disk space and the download time for a particular provider
 	// version between different configurations on the same system.
 	globalCacheDir *Dir
+
+	// builtInProviderTypes is an optional set of types that should be
+	// considered valid to appear in the special terraform.io/builtin/...
+	// namespace, which we use for providers that are built in to Terraform
+	// and thus do not need any separate installation step.
+	builtInProviderTypes []string
+
+	// pluginProtocolVersion is the protocol version terrafrom core supports to
+	// communicate with servers, and is used to resolve plugin discovery with
+	// terraform registry, in addition to any specified plugin version
+	// constraints.
+	pluginProtocolVersion getproviders.VersionConstraints
 }
+
+// The currently-supported plugin protocol version.
+var SupportedPluginProtocols = getproviders.MustParseVersionConstraints("~> 5")
 
 // NewInstaller constructs and returns a new installer with the given target
 // directory and provider source.
@@ -47,8 +64,9 @@ type Installer struct {
 // or the result is undefined.
 func NewInstaller(targetDir *Dir, source getproviders.Source) *Installer {
 	return &Installer{
-		targetDir: targetDir,
-		source:    source,
+		targetDir:             targetDir,
+		source:                source,
+		pluginProtocolVersion: SupportedPluginProtocols,
 	}
 }
 
@@ -63,10 +81,28 @@ func (i *Installer) SetGlobalCacheDir(cacheDir *Dir) {
 	// A little safety check to catch straightforward mistakes where the
 	// directories overlap. Better to panic early than to do
 	// possibly-distructive actions on the cache directory downstream.
-	if same, err := copydir.SameFile(i.targetDir.baseDir, cacheDir.baseDir); err == nil && !same {
-		panic(fmt.Sprintf("global cache directory %s must not match the installation target directory", i.targetDir.baseDir))
+	if same, err := copydir.SameFile(i.targetDir.baseDir, cacheDir.baseDir); err == nil && same {
+		panic(fmt.Sprintf("global cache directory %s must not match the installation target directory %s", cacheDir.baseDir, i.targetDir.baseDir))
 	}
 	i.globalCacheDir = cacheDir
+}
+
+// SetBuiltInProviderTypes tells the receiver to consider the type names in the
+// given slice to be valid as providers in the special special
+// terraform.io/builtin/... namespace that we use for providers that are
+// built in to Terraform and thus do not need a separate installation step.
+//
+// If a caller requests installation of a provider in that namespace, the
+// installer will treat it as a no-op if its name exists in this list, but
+// will produce an error if it does not.
+//
+// The default, if this method isn't called, is for there to be no valid
+// builtin providers.
+//
+// Do not modify the buffer under the given slice after passing it to this
+// method.
+func (i *Installer) SetBuiltInProviderTypes(types []string) {
+	i.builtInProviderTypes = types
 }
 
 // EnsureProviderVersions compares the given provider requirements with what
@@ -112,6 +148,42 @@ func (i *Installer) EnsureProviderVersions(ctx context.Context, reqs getprovider
 	mightNeed := map[addrs.Provider]getproviders.VersionSet{}
 MightNeedProvider:
 	for provider, versionConstraints := range reqs {
+		if provider.IsBuiltIn() {
+			// Built in providers do not require installation but we'll still
+			// verify that the requested provider name is valid.
+			valid := false
+			for _, name := range i.builtInProviderTypes {
+				if name == provider.Type {
+					valid = true
+					break
+				}
+			}
+			var err error
+			if valid {
+				if len(versionConstraints) == 0 {
+					// Other than reporting an event for the outcome of this
+					// provider, we'll do nothing else with it: it's just
+					// automatically available for use.
+					if cb := evts.BuiltInProviderAvailable; cb != nil {
+						cb(provider)
+					}
+				} else {
+					// A built-in provider is not permitted to have an explicit
+					// version constraint, because we can only use the version
+					// that is built in to the current Terraform release.
+					err = fmt.Errorf("built-in providers do not support explicit version constraints")
+				}
+			} else {
+				err = fmt.Errorf("this Terraform release has no built-in provider named %q", provider.Type)
+			}
+			if err != nil {
+				errs[provider] = err
+				if cb := evts.BuiltInProviderFailure; cb != nil {
+					cb(provider, err)
+				}
+			}
+			continue
+		}
 		acceptableVersions := versions.MeetingConstraints(versionConstraints)
 		if mode.forceQueryAllProviders() {
 			// If our mode calls for us to look for newer versions regardless
@@ -240,6 +312,45 @@ NeedProvider:
 			continue
 		}
 
+		// if the package meta includes provider protocol versions, verify that terraform supports it.
+		if len(meta.ProtocolVersions) > 0 {
+			protoVersions := versions.MeetingConstraints(i.pluginProtocolVersion)
+			match := false
+			for _, version := range meta.ProtocolVersions {
+				if protoVersions.Has(version) {
+					match = true
+				}
+			}
+			if match == false {
+				// Find the closest matching version
+				closestAvailable := i.findClosestProtocolCompatibleVersion(provider, version)
+				if closestAvailable == versions.Unspecified {
+					err := fmt.Errorf(errProviderVersionIncompatible, provider)
+					errs[provider] = err
+					if cb := evts.FetchPackageFailure; cb != nil {
+						cb(provider, version, err)
+					}
+					continue
+				}
+
+				// Determine if the closest matching provider is newer or older
+				// than the requirement in order to send the appropriate error
+				// message.
+				var protoErr string
+				if version.GreaterThan(closestAvailable) {
+					protoErr = providerProtocolTooNew
+				} else {
+					protoErr = providerProtocolTooOld
+				}
+
+				errs[provider] = fmt.Errorf(protoErr, provider, version, tfversion.String(), closestAvailable.String(), closestAvailable.String(), getproviders.VersionConstraintsString(reqs[provider]))
+				if cb := evts.FetchPackageFailure; cb != nil {
+					cb(provider, version, err)
+				}
+				continue
+			}
+		}
+
 		// Step 3c: Retrieve the package indicated by the metadata we received,
 		// either directly into our target directory or via the global cache
 		// directory.
@@ -254,7 +365,7 @@ NeedProvider:
 			installTo = i.targetDir
 			linkTo = nil // no linking needed
 		}
-		err = installTo.InstallPackage(ctx, meta)
+		authResult, err := installTo.InstallPackage(ctx, meta)
 		if err != nil {
 			// TODO: Consider retrying for certain kinds of error that seem
 			// likely to be transient. For now, we just treat all errors equally.
@@ -267,6 +378,7 @@ NeedProvider:
 		new := installTo.ProviderVersion(provider, version)
 		if new == nil {
 			err := fmt.Errorf("after installing %s it is still not detected in the target directory; this is a bug in Terraform", provider)
+			errs[provider] = err
 			if cb := evts.FetchPackageFailure; cb != nil {
 				cb(provider, version, err)
 			}
@@ -288,8 +400,43 @@ NeedProvider:
 		}
 		selected[provider] = version
 		if cb := evts.FetchPackageSuccess; cb != nil {
-			cb(provider, version, new.PackageDir)
+			cb(provider, version, new.PackageDir, authResult)
 		}
+	}
+
+	// We'll remember our selections in a lock file inside the target directory,
+	// so callers can recover those exact selections later by calling
+	// SelectedPackages on the same installer.
+	lockEntries := map[addrs.Provider]lockFileEntry{}
+	for provider, version := range selected {
+		cached := i.targetDir.ProviderVersion(provider, version)
+		if cached == nil {
+			err := fmt.Errorf("selected package for %s is no longer present in the target directory; this is a bug in Terraform", provider)
+			errs[provider] = err
+			if cb := evts.HashPackageFailure; cb != nil {
+				cb(provider, version, err)
+			}
+			continue
+		}
+		hash, err := cached.Hash()
+		if err != nil {
+			errs[provider] = fmt.Errorf("failed to calculate checksum for installed provider %s package: %s", provider, err)
+			if cb := evts.HashPackageFailure; cb != nil {
+				cb(provider, version, err)
+			}
+			continue
+		}
+		lockEntries[provider] = lockFileEntry{
+			SelectedVersion: version,
+			PackageHash:     hash,
+		}
+	}
+	err := i.lockFile().Write(lockEntries)
+	if err != nil {
+		// This is one of few cases where this function does _not_ return an
+		// InstallerError, because failure to write the lock file is a more
+		// general problem, not specific to a certain provider.
+		return selected, fmt.Errorf("failed to record a manifest of selected providers: %s", err)
 	}
 
 	if len(errs) > 0 {
@@ -298,6 +445,60 @@ NeedProvider:
 		}
 	}
 	return selected, nil
+}
+
+func (i *Installer) lockFile() *lockFile {
+	return &lockFile{
+		filename: filepath.Join(i.targetDir.baseDir, "selections.json"),
+	}
+}
+
+// SelectedPackages returns the metadata about the packages chosen by the
+// most recent call to EnsureProviderVersions, which are recorded in a lock
+// file in the installer's target directory.
+//
+// If EnsureProviderVersions has never been run against the current target
+// directory, the result is a successful empty response indicating that nothing
+// is selected.
+//
+// SelectedPackages also verifies that the package contents are consistent
+// with the checksums that were recorded at installation time, reporting an
+// error if not.
+func (i *Installer) SelectedPackages() (map[addrs.Provider]*CachedProvider, error) {
+	entries, err := i.lockFile().Read()
+	if err != nil {
+		// Read does not return an error for "file not found", so this should
+		// always be some other error.
+		return nil, fmt.Errorf("failed to read selections file: %s", err)
+	}
+
+	ret := make(map[addrs.Provider]*CachedProvider, len(entries))
+	errs := make(map[addrs.Provider]error)
+	for provider, entry := range entries {
+		cached := i.targetDir.ProviderVersion(provider, entry.SelectedVersion)
+		if cached == nil {
+			errs[provider] = fmt.Errorf("package for selected version %s is no longer available in the local cache directory", entry.SelectedVersion)
+			continue
+		}
+
+		ok, err := cached.MatchesHash(entry.PackageHash)
+		if err != nil {
+			errs[provider] = fmt.Errorf("failed to verify checksum for v%s package: %s", entry.SelectedVersion, err)
+			continue
+		}
+		if !ok {
+			errs[provider] = fmt.Errorf("checksum mismatch for v%s package", entry.SelectedVersion)
+			continue
+		}
+		ret[provider] = cached
+	}
+
+	if len(errs) > 0 {
+		return ret, InstallerError{
+			ProviderErrors: errs,
+		}
+	}
+	return ret, nil
 }
 
 // InstallMode customizes the details of how an install operation treats
@@ -347,3 +548,56 @@ func (err InstallerError) Error() string {
 	}
 	return b.String()
 }
+
+// findClosestProtocolCompatibleVersion searches for the provider version with the closest protocol match.
+func (i *Installer) findClosestProtocolCompatibleVersion(provider addrs.Provider, version versions.Version) versions.Version {
+	var match versions.Version
+	available, _ := i.source.AvailableVersions(provider)
+	available.Sort()                                       // put the versions in increasing order of precedence
+	for index := len(available) - 1; index >= 0; index-- { // walk backwards to consider newer versions first
+		meta, _ := i.source.PackageMeta(provider, available[index], i.targetDir.targetPlatform)
+		if len(meta.ProtocolVersions) > 0 {
+			protoVersions := versions.MeetingConstraints(i.pluginProtocolVersion)
+			for _, version := range meta.ProtocolVersions {
+				if protoVersions.Has(version) {
+					match = available[index]
+					break // we will only consider the newest matching version
+				}
+			}
+		}
+	}
+	return match
+}
+
+// providerProtocolTooOld is a message sent to the CLI UI if the provider's
+// supported protocol versions are too old for the user's version of terraform,
+// but an older version of the provider is compatible.
+const providerProtocolTooOld = `
+Provider %q v%s is not compatible with Terraform %s.
+Provider version %s is the earliest compatible version. Select it with 
+the following version constraint:
+	version = %q
+Terraform checked all of the plugin versions matching the given constraint:
+	%s
+Consult the documentation for this provider for more information on
+compatibility between provider and Terraform versions.
+`
+
+// providerProtocolTooNew is a message sent to the CLI UI if the provider's
+// supported protocol versions are too new for the user's version of terraform,
+// and the user could either upgrade terraform or choose an older version of the
+// provider
+const providerProtocolTooNew = `
+Provider %q v%s is not compatible with Terraform %s.
+Provider version %s is the latest compatible version. Select it with 
+the following constraint:
+	version = %q
+Terraform checked all of the plugin versions matching the given constraint:
+	%s
+Consult the documentation for this provider for more information on
+compatibility between provider and Terraform versions.
+Alternatively, upgrade to the latest version of Terraform for compatibility with newer provider releases.
+`
+
+// there does exist a version outside of the constaints that is compatible.
+const errProviderVersionIncompatible = `No compatible versions of provider %s were found.`
